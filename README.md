@@ -18,6 +18,25 @@ tables, method, historical lanes). Checkpoint / encoder:
 
 ---
 
+## OS optimizations
+
+This cluster runs on 2× DGX Spark (NVIDIA GB10, ARM64). The following
+OS-level changes were applied to both nodes for inference performance:
+
+- **CPU affinity pinning** — systemd services pinned to slow cores (0–4, 10–14)
+  so fast cores (5–9, 15–19) stay free for vLLM GPU orchestration and NCCL.
+- **IRQ affinity service** — NVIDIA GPU and RoCE (mlx5/ConnectX) interrupts
+  pinned to slow cores to prevent IRQ handling from stealing fast-core cycles.
+- **Headless boot** — `multi-user.target` instead of `graphical.target` to
+  free GPU memory and CPU cycles.
+- **RoCE host entries** — `/etc/hosts` entries for `192.168.100.x` on both
+  nodes so NCCL can resolve peer addresses over the RoCE fabric.
+
+Full documentation with reproduce steps and rollback procedure:
+**[docs/os-changes.md](docs/os-changes.md)**.
+
+---
+
 ## Quick start
 
 Run everything from the **head** node. You need two DGX Sparks, RoCE/NCCL
@@ -485,8 +504,8 @@ is **CPU-only** (`scripts/ci-validate.sh`). Live tok/s still needs the 2× Spark
 | `start-` / `stop-` / `status-` / `logs-` / `smoke-*.sh` | Two-node ops |
 | `prepare-dspark-model-cache.sh` | 0731 (and optional VL) on head **and** worker |
 | `scripts/benchmark-0731.py` | Prompt × concurrency sweep |
+| [docs/os-changes.md](docs/os-changes.md) | OS-level tuning (CPU affinity, IRQ pinning, headless boot) |
 | [docs/ENVS.md](docs/ENVS.md) | Anemll vs Stage-C env matrix |
-| [docs/PATCHES.md](docs/PATCHES.md) | Keys / #27 / #22 notes |
 | `patches/` | Issue hotfixes applied at container start |
 | `docker-compose.stage-c.override.yml` | Stage-C-only env injection |
 | `build-dspark-vllm-runtime.sh` | Optional local Stage-C image |
