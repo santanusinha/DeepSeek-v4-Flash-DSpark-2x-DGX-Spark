@@ -11,6 +11,7 @@ services:
     restart: ${DSPARK_RESTART_POLICY:-unless-stopped}
     stop_grace_period: ${DSPARK_STOP_GRACE:-10s}
 
+    cpuset: "5-9,15-19"
     ulimits:
       memlock: -1
       stack: 67108864
