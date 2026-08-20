@@ -230,22 +230,66 @@ The DGX Spark GB10 uses **unified memory** — GPU and CPU share the same 120 Gi
 
 ### Fix: Reduce Kernel Swap Aggressiveness
 
-**File**: `/etc/sysctl.d/99-swap-tune.conf` (on both nodes)
+**File**: `/etc/sysctl.d/99-vm-tune.conf` (on both nodes)
 
 ```ini
-# Reduce swap aggressiveness for VLLM inference workloads
+# VM tuning for VLLM inference workloads
 # DGX Spark has unified memory (GPU/CPU share 120 GiB RAM).
 # Default swappiness=60 causes the kernel to swap VLLM pages
 # under memory pressure, causing latency spikes on tool calls.
-vm.swappiness=10
 
-# Reduce page cache reclaim pressure to keep VLLM pages resident
-vm.vfs_cache_pressure=50
+# Near-zero swap (only under extreme OOM pressure)
+vm.swappiness=1
+
+# Aggressively reclaim page cache before even considering swapping
+# process pages. This keeps VLLM resident by sacrificing cached files.
+vm.vfs_cache_pressure=200
 ```
 
 **Effect**:
-- `vm.swappiness=10` — kernel only swaps under extreme memory pressure (was 60)
-- `vm.vfs_cache_pressure=50` — kernel reclaims page cache at half the default rate, keeping VLLM process pages resident longer
+- `vm.swappiness=1` — kernel only swaps under near-OOM conditions (was 60)
+- `vm.vfs_cache_pressure=200` — kernel reclaims page cache at double the normal rate, **preferring to evict cached files rather than swap VLLM process pages**
+
+**Why these values**:
+- `swappiness=1` instead of `0` because `0` means "no swap until OOM" which can trigger the OOM killer on a transient spike. `1` allows a tiny amount of swap as a safety valve.
+- `vfs_cache_pressure=200` instead of the earlier `50` because we want the kernel to **prefer evicting page cache over swapping VLLM**. Page cache just gets re-read from disk; swapped VLLM pages cause multi-second latency spikes.
+
+**Reproduce**:
+```bash
+sudo tee /etc/sysctl.d/99-vm-tune.conf << 'EOF'
+# VM tuning for VLLM inference workloads
+vm.swappiness=1
+vm.vfs_cache_pressure=200
+EOF
+sudo sysctl -w vm.swappiness=1
+sudo sysctl -w vm.vfs_cache_pressure=200
+```
+
+**Verify**:
+```bash
+cat /proc/sys/vm/swappiness           # should print: 1
+cat /proc/sys/vm/vfs_cache_pressure   # should print: 200
+```
+
+**Monitor swap drain**:
+```bash
+# Check VLLM process swap (should trend toward 0)
+for pid in $(pgrep -f VLLM); do
+  name=$(cat /proc/$pid/comm 2>/dev/null)
+  swap=$(cat /proc/$pid/status 2>/dev/null | grep VmSwap | awk '{print $2}')
+  echo "PID $pid ($name): Swap=${swap}kB"
+done
+
+# Overall swap usage
+swapon --show
+```
+
+**Revert**:
+```bash
+sudo rm /etc/sysctl.d/99-vm-tune.conf
+sudo sysctl -w vm.swappiness=60
+sudo sysctl -w vm.vfs_cache_pressure=100
+```
 
 **Reproduce**:
 ```bash
