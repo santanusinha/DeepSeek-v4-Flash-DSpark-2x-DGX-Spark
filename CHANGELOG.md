@@ -1,3 +1,36 @@
+## 2026-08-20
+
+### Fixed
+
+- **Hub timeouts abort large-shard downloads in `prepare-dspark-model-cache.sh`**: both `docker run` blocks (`run_download` and `verify_cache`) now pass `HF_HUB_DOWNLOAD_TIMEOUT` (default `120`) and `HF_HUB_ETAG_TIMEOUT` (default `30`). `huggingface_hub` defaults both to 10s, which is short enough that a slow or proxied link kills a multi-GB shard mid-transfer rather than riding it out. Override in `.env.dspark`.
+
+## 2026-08-19
+
+### Changed
+
+- **Ride out mid-serve TileLang/CuTeDSL JIT instead of killing EngineCore ([Issue #65](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/65), [Issue #87](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/87))**: compose now injects `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800` (stock 300) and `TILELANG_CACHE_DIR=/cache/huggingface/tilelang-cache` on the HF volume. Does not retune NCCL; a true TP hang still needs a paired `./stop && ./start`. Takes effect on the next container recreate.
+
+- **#27 hotfix: allow 2 overlapping chunked prefills via `DSPARK_MAX_INFLIGHT_PREFILLS` (default 2).** Anemll `0.1.1` still rejects `--max-num-partial-prefills` (issue #45). The shipped #27 gate therefore read `SchedulerConfig.max_num_partial_prefills` (always 1) and serialized every long prefill — 32K×c4 decode sat on the ~8 tok/s floor. The hotfix now honors `DSPARK_MAX_INFLIGHT_PREFILLS` (clamped 1–3) from compose. Live A/B on this 2× Spark stack (`thinking=false`, `LONG_PREFILL_TOKEN_THRESHOLD=1024`, #43 floor on): 32K×c4 per-stream decode **8.2 → 24.6 tok/s**; 256×c6 aggregate unchanged (~175); 12 min 32K×c2 soak 21/21 pass; preemptions 0. Set `1` to restore the old serial gate. Does not implement real Concurrent Partial Prefill.
+
+### Fixed
+
+- **Speculative-acceptance per-position curve was always empty ([PR #91](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/91))**: the parser assumed `position` was followed by another label, but Anemll `0.1.1` emits it last, so every sample raised inside a swallowed exception. The parser now matches the label independent of order, excludes the sibling `_created` timestamp gauge, and reports this measurement window as accepted tokens per draft rather than container-lifetime totals.
+
+- **RULER-lite never reached its advertised context lengths ([Issue #81](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/81))**: `pad_to_length` appended one haystack sentence per loop with `guard < 200`, so every cell capped at ~4.8k tokens while still exiting 0. It now bulk-pads and `run_case` fails if `/tokenize` is under 97% of the target.
+
+- **RULER-lite scored its own client timeout as a model FAIL past ~790k tokens ([PR #85](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/pull/85))**: `request_json` pinned `timeout=900`, but the recorded 899,994-token acceptance run needs 1,028.85 s to first token at ~874.8 prefill tok/s, so 900 s only covers ~787k tokens of prefill — the client hung up mid-prefill and the case was reported as a model failure. Adds `--request-timeout` (default unchanged at 900 s; must be finite and > 0), plumbed through `scripts/run-audit.sh` so a raised `--lengths` can be paired with it. Only the timeout half of PR #85 was taken: its `pad_to_length` rewrite duplicated `8997d41`, cost an extra `/tokenize` round trip at every depth, and dropped the `haystack_reps` test seam.
+
+## 2026-08-18
+
+### Changed
+
+- **Issue #52 / PR #53: assistant-final continuation hotfix is now opt-in (`DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX`, default `0` = stock)** (`patches/hotfix-dsv4-assistant-final-continuation.py`): a request whose `messages` array ends with an assistant message renders with a bare EOS and no generation header, so the model generates from a dead state — the reported agent-harness loop of empty no-op turns with hallucinated DSML markup fragments. At the previous PR head the compose entrypoint already ran this patcher unconditionally inside the encoder-copy chain; this change restores **default stock rendering** (patch file stays mounted/synced to the worker but is never invoked) and moves invocation behind an exactly-`1` gate in `docker-compose.dspark.yml`, chained with `|| exit 1` so an ON boot fails rather than serving an unpatched or unverified encoder. The patcher itself is now fail-closed: missing encoder file (prerequisite), missing anchor, or a failed post-write self-check (patched module must import and render a trailing-assistant transcript with a generation header) all exit nonzero, any failed self-check **restores the original file bytes**, and an already-patched encoder is re-validated instead of rewritten (idempotent). Documented in `.env.dspark.example` and `docs/PATCHES.md`; CPU gates in `scripts/test-assistant-final-continuation.py` use the checkpoint's real encoder signature and separate render/transition control flow, proving stock bytes plus one appended header for assistant-final input, byte identity for every non-assistant-final shape, idempotence, fail-closed/restore, and static OFF-default compose/start wiring. They are wired into `scripts/ci-validate.sh`.
+
+  Evidence status, stated exactly: render and no-regression evidence is from prior head `f08cd6c` — a causal one-prompt A/B via `/v1/completions` where the trailing turn left open produced 183 tokens with a coherent continuation versus 400 tokens of raw `<|DSML|tool_calls>` markup when closed with EOS, plus the `wo_eos` comparison showing reopening a *complete* turn yields a 1-token empty generation. **No rescue claim**: the live no-op-turn defect did not reproduce in that session, so there is no measured stuck-harness recovery. A first gated-ON boot on `d4b31daf` failed closed before serving because a review-requested guard named the nonexistent checkpoint variable `add_generation_prompt`; the original encoder bytes were restored. Corrected code commit `0864014` passed serialized live OFF/ON proof on both ranks: OFF had effective flag `0`, no patch marker, and a stock EOS render; ON had effective flag `1`, both ranks patched and verified, preserved all 98 stock token IDs, appended exactly `<|Assistant|><think>`, and completed a live continuation with `alpha beta`. Re-running on both ranks verified idempotence. A deliberate anchor-drift boot failed with exit `1` on both ranks and never served the API.
+### Fixed
+
+- **vLLM shm spin-wait wasting Grace P-cores on TP=2 ([Issue #79](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark/issues/79))**: `patches/hotfix-gb10-spin-wait.sh` flips `SpinCondition.busy_loop_s` from `1` to `0.002` in-image before `exec vllm`. Decode IPC always lands inside the old 1s window, so `sched_yield` never fell through to sleep. Opt out with `DSPARK_SKIP_SPIN_WAIT_HOTFIX=1`. Not gated by `DSPARK_SKIP_HOTFIX`. Same one-line change as PRs #71/#74.
+
 ## 2026-08-17
 
 ### Fixed

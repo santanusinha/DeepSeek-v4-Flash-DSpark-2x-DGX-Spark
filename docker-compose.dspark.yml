@@ -42,6 +42,10 @@ services:
       - ${DSPARK_ISSUE26_HOTFIX:-./patches/hotfix-dsv4-issue26-hybrid-swa-min.py}:/opt/hotfix-dsv4-issue26-hybrid-swa-min.py:ro
       # Client stop strings stay dormant until </think> (Tony/Capicua25x Patch 5).
       - ${DSPARK_SUPPRESS_STOPS_HOTFIX:-./patches/hotfix-dsv4-suppress-stops-in-reasoning.py}:/opt/hotfix-dsv4-suppress-stops-in-reasoning.py:ro
+      # A request ending with an assistant message must still get a generation
+      # header, or the model generates from a dead state (empty turns /
+      # hallucinated DSML markup loop). Upstream issue #52, PR #53.
+      - ${DSPARK_ASSISTANT_FINAL_HOTFIX:-./patches/hotfix-dsv4-assistant-final-continuation.py}:/opt/hotfix-dsv4-assistant-final-continuation.py:ro
       - ${DSPARK_PATCHES_DIR:-./patches}:/opt/dspark-patches:ro
       - ${DSPARK_TMP_HOST:-${HOME}/.cache/dspark-tmp}:/tmp
 
@@ -64,6 +68,9 @@ services:
       # (scheduled prefill/decode tokens per request + zero-token decode
       # skips) when set to 1. Off by default (zero overhead).
       DSPARK_ISSUE43_SCHED_DIAG: "${DSPARK_ISSUE43_SCHED_DIAG:-0}"
+      # In-flight partial-prefill cap for the #27 hotfix (1-3, default 2).
+      # Do NOT pass --max-num-partial-prefills (Anemll 0.1.1 rejects it).
+      DSPARK_MAX_INFLIGHT_PREFILLS: "${DSPARK_MAX_INFLIGHT_PREFILLS:-2}"
       # Pin HF revision (issue #19). Empty → tip of default branch / refs/main.
       DSPARK_REVISION: "${DSPARK_REVISION:-}"
       DSPARK_ENCODING_FILE: "${DSPARK_ENCODING_FILE:-}"
@@ -81,6 +88,11 @@ services:
 
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-1}"
       VLLM_USE_BREAKABLE_CUDAGRAPH: "${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
+      # Issue #65/#87: mid-serve CuTeDSL/TileLang JIT can exceed the 300s
+      # sample_tokens RPC default and kill EngineCore (looks like an NCCL
+      # wedge on TP=2). 1800s rides out a worst-case compile; a true hang
+      # just surfaces later. Override to 300 to restore stock.
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 
       VLLM_USE_B12X_MOE: "${VLLM_USE_B12X_MOE:-1}"
       VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: "${VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM:-0}"
@@ -97,6 +109,9 @@ services:
       FLASHINFER_DISABLE_VERSION_CHECK: "${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
       FLASHINFER_WORKSPACE_BASE: "${FLASHINFER_WORKSPACE_BASE:-/cache/huggingface/flashinfer}"
       TILELANG_CLEANUP_TEMP_FILES: "${TILELANG_CLEANUP_TEMP_FILES:-1}"
+      # Persist TileLang compiled kernels on the HF cache volume (issue #65).
+      # Default in-image path was ~/.tilelang/cache (lost on recreate).
+      TILELANG_CACHE_DIR: "${TILELANG_CACHE_DIR:-/cache/huggingface/tilelang-cache}"
       DG_JIT_USE_NVRTC: "${DG_JIT_USE_NVRTC:-0}"
       DG_JIT_NVCC_COMPILER: "${DG_JIT_NVCC_COMPILER:-/usr/local/cuda/bin/nvcc}"
       PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -126,6 +141,12 @@ services:
       DSPARK_SKIP_HOTFIX: "${DSPARK_SKIP_HOTFIX:-0}"
       DSPARK_SKIP_ISSUE22_HOTFIX: "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}"
       DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX: "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}"
+      # Issue #52 / PR #53: render a generation header when a request's
+      # messages array ends with an assistant turn (bare-EOS dead state ->
+      # empty no-op turn loop). 0 (default) = stock renderer, patch not
+      # invoked; 1 = apply at boot and fail the container on any patch error.
+      DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX: "${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}"
+      DSPARK_SKIP_SPIN_WAIT_HOTFIX: "${DSPARK_SKIP_SPIN_WAIT_HOTFIX:-0}"
       # 1 = keep client stop strings dormant inside <think> (default).
       # 0 = stock vLLM (stops can fire mid-reason). Also honors
       # VLLM_SUPPRESS_STOPS_IN_REASONING if that is set in .env.
@@ -156,8 +177,10 @@ services:
         if [ -z "$${ENCODING_SOURCE}" ] && [ -f /models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py ]; then ENCODING_SOURCE=/models/deepseek-ai/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py; fi;
         if [ -n "$${ENCODING_SOURCE}" ] && [ -f "$${ENCODING_SOURCE}" ]; then cp "$${ENCODING_SOURCE}" /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4_encoding.py; python3 -c 'from pathlib import Path; p=Path("/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/deepseek_v4.py"); s=p.read_text(); old="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            else:\n                reasoning_effort = \"high\""; new="elif reasoning_effort in (\"max\", \"xhigh\"):\n                reasoning_effort = \"max\"\n            elif reasoning_effort == \"high\":\n                reasoning_effort = \"high\"\n            else:\n                reasoning_effort = \"low\""; updated=s.replace(old,new); assert new in updated; p.write_text(updated)'; python3 /opt/hotfix-encoding-dsv4-issue21.py; else echo "WARN: encoding_dsv4.py not found (set DSPARK_ENCODING_FILE or check the model snapshot) - encoder copy, reasoning-effort mapping and issue21 skipped" >&2; fi; python3 /opt/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py; python3 /opt/hotfix-dsv4-issue55-tool-truncation.py;
         if [ "$${DSPARK_SKIP_ISSUE22_HOTFIX:-0}" != "1" ] && [ -f /opt/dspark-patches/hotfix-nvfp4-ds-mla-issue22.sh ]; then bash /opt/dspark-patches/hotfix-nvfp4-ds-mla-issue22.sh || true; fi;
+        if [ "$${DSPARK_SKIP_SPIN_WAIT_HOTFIX:-0}" != "1" ] && [ -f /opt/dspark-patches/hotfix-gb10-spin-wait.sh ]; then bash /opt/dspark-patches/hotfix-gb10-spin-wait.sh || true; fi;
         if [ "$${DSPARK_SKIP_HOTFIX:-0}" != "1" ]; then for _hf in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh; do if [ -f /opt/dspark-patches/$${_hf} ]; then bash /opt/dspark-patches/$${_hf} || true; fi; done; fi;
         python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py; python3 /opt/hotfix-dsv4-issue43-decode-fairness-and-diag.py; python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py; if [ "$${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}" != "1" ]; then python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py; fi; VLLM_QUANTIZATION_ARGS="";
+        if [ "$${DSPARK_ENABLE_ASSISTANT_FINAL_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-assistant-final-continuation.py || exit 1; fi;
         if [ "$${ENABLE_VLLM_GB10_PATCH:-0}" = "1" ]; then
           python3 -m pip install -e /opt/vllm-gb10-hybrid-nvfp4 --no-deps;
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
