@@ -210,3 +210,112 @@ systemctl get-default
 # Check RoCE host entries
 grep -E "192.168.100" /etc/hosts
 ```
+---
+
+## 6. Swap and Memory Pressure Reduction
+
+**Date**: 2026-08-20
+**Nodes**: Both `ai1` (head) and `ai2` (worker)
+
+### Problem
+
+The DGX Spark GB10 uses **unified memory** — GPU and CPU share the same 120 GiB physical RAM. Under load, the kernel's page reclaimer was aggressively swapping VLLM process pages to disk, causing latency spikes when tool calls or idle periods triggered page-faults back from swap.
+
+**Evidence** (before fix):
+- System memory: 113 GiB used out of 121 GiB (93%)
+- VLLM Worker_TP0 process: **~870 MiB swapped**
+- VLLM EngineCore process: **~250 MiB swapped**
+- Total swap usage: **~2.7 GiB** out of 16 GiB
+- Default `vm.swappiness=60` was too aggressive for a dedicated inference node
+
+### Fix: Reduce Kernel Swap Aggressiveness
+
+**File**: `/etc/sysctl.d/99-swap-tune.conf` (on both nodes)
+
+```ini
+# Reduce swap aggressiveness for VLLM inference workloads
+# DGX Spark has unified memory (GPU/CPU share 120 GiB RAM).
+# Default swappiness=60 causes the kernel to swap VLLM pages
+# under memory pressure, causing latency spikes on tool calls.
+vm.swappiness=10
+
+# Reduce page cache reclaim pressure to keep VLLM pages resident
+vm.vfs_cache_pressure=50
+```
+
+**Effect**:
+- `vm.swappiness=10` — kernel only swaps under extreme memory pressure (was 60)
+- `vm.vfs_cache_pressure=50` — kernel reclaims page cache at half the default rate, keeping VLLM process pages resident longer
+
+**Reproduce**:
+```bash
+sudo tee /etc/sysctl.d/99-swap-tune.conf << 'EOF'
+# Reduce swap aggressiveness for VLLM inference workloads
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+EOF
+sudo sysctl -w vm.swappiness=10
+sudo sysctl -w vm.vfs_cache_pressure=50
+```
+
+**Verify**:
+```bash
+cat /proc/sys/vm/swappiness       # should print: 10
+cat /proc/sys/vm/vfs_cache_pressure  # should print: 50
+```
+
+**Monitor swap usage**:
+```bash
+# Check VLLM process swap
+for pid in $(pgrep -f VLLM); do
+  name=$(cat /proc/$pid/comm 2>/dev/null)
+  swap=$(cat /proc/$pid/status 2>/dev/null | grep VmSwap | awk '{print $2}')
+  echo "PID $pid ($name): Swap=${swap}kB"
+done
+
+# Overall swap usage
+swapon --show
+```
+
+**Revert**:
+```bash
+sudo rm /etc/sysctl.d/99-swap-tune.conf
+sudo sysctl -w vm.swappiness=60
+sudo sysctl -w vm.vfs_cache_pressure=100
+```
+
+---
+
+## 7. Verification Commands (Updated)
+
+```bash
+# Check CPU affinity
+cat /etc/systemd/system.conf.d/cpu-affinity.conf
+
+# Check IRQ affinity service
+systemctl is-enabled irq-affinity.service
+systemctl is-active irq-affinity.service
+
+# Check IRQ pinning at runtime
+grep -iE "nvidia|mlx5|roce" /proc/interrupts | while read line; do
+  irq=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+  echo "IRQ $irq: $(cat /proc/irq/$irq/smp_affinity_list 2>/dev/null)"
+done
+
+# Check default target
+systemctl get-default
+
+# Check RoCE host entries
+grep -E "192.168.100" /etc/hosts
+
+# Check swap tuning
+cat /proc/sys/vm/swappiness
+cat /proc/sys/vm/vfs_cache_pressure
+
+# Check VLLM process swap
+for pid in $(pgrep -f VLLM); do
+  name=$(cat /proc/$pid/comm 2>/dev/null)
+  swap=$(cat /proc/$pid/status 2>/dev/null | grep VmSwap | awk '{print $2}')
+  echo "PID $pid ($name): Swap=${swap}kB"
+done
+```
