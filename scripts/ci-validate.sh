@@ -17,8 +17,12 @@ for f in \
   validate-dspark-config.sh \
   prepare-dspark-model-cache.sh \
   smoke-deepseek-v4-flash-dspark.sh \
+  status-deepseek-v4-flash-dspark.sh \
   scripts/ci-validate.sh \
   scripts/verify-overlay-sources.sh \
+  scripts/test-draft-sample-method-gate.sh \
+  scripts/test-nccl-fabric-passthrough.sh \
+  scripts/test-nccl-ib-hca-gid-resolve.sh \
   patches/*.sh
 do
   [ -e "$f" ] || continue
@@ -39,6 +43,12 @@ py_files+=(
   scripts/spec-acceptance.py
   scripts/test-spec-acceptance.py
   scripts/test-ruler-lite-pad.py
+  scripts/test-env-normalisation.py
+  scripts/test-dspark-api-keys.py
+  scripts/test-redact-api-key-log.py
+  scripts/test-hotfix-atomic-transaction.py
+  scripts/test-python-hotfix-failclosed.py
+  scripts/test-empty-encoder-output-hotfix.py
   scripts/ruler-lite.py
   scripts/verify-dsv4-027-equality-gate.py
 )
@@ -64,12 +74,30 @@ python3 scripts/test-spec-acceptance.py -q
 ok "test-spec-acceptance"
 python3 scripts/test-ruler-lite-pad.py -q
 ok "test-ruler-lite-pad"
+python3 scripts/test-env-normalisation.py -q
+ok "test-env-normalisation"
+python3 scripts/test-dspark-api-keys.py -q
+ok "test-dspark-api-keys"
+python3 scripts/test-redact-api-key-log.py -q
+ok "test-redact-api-key-log"
+python3 scripts/test-hotfix-atomic-transaction.py -q
+ok "test-hotfix-atomic-transaction"
+python3 scripts/test-python-hotfix-failclosed.py -q
+ok "test-python-hotfix-failclosed"
+python3 scripts/test-empty-encoder-output-hotfix.py -q
+ok "test-empty-encoder-output-hotfix"
 python3 tests/test_issue27_inflight_cap.py -q
 ok "test_issue27_inflight_cap"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"
 bash scripts/verify-overlay-sources.sh
 ok "verify-overlay-sources"
+bash scripts/test-draft-sample-method-gate.sh -q
+ok "test-draft-sample-method-gate"
+bash scripts/test-nccl-fabric-passthrough.sh -q
+ok "test-nccl-fabric-passthrough"
+bash scripts/test-nccl-ib-hca-gid-resolve.sh -q
+ok "test-nccl-ib-hca-gid-resolve"
 
 echo "== recipe guards (do not re-ship known regressions) =="
 
@@ -131,28 +159,37 @@ if grep -q 'hotfix-dsv4-issue26-hybrid-swa-min.py' docker-compose.dspark.yml \
 else
   bad "compose missing #26 or #27 mount"
 fi
-if grep -q 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py' docker-compose.dspark.yml; then
-  ok "compose entrypoint applies #26 + #27"
+if grep -Fq 'python3 /opt/hotfix-dsv4-issue26-hybrid-swa-min.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-dsv4-issue27-partial-prefill-concurrency.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies #26 + #27 fail-closed"
 else
-  bad "compose entrypoint does not apply #26 + #27"
+  bad "compose must apply #26 + #27 with || exit 1"
 fi
-if grep -q 'hotfix-dsv4-suppress-stops-in-reasoning.py' docker-compose.dspark.yml; then
-  ok "compose applies suppress-stops-in-reasoning"
+if grep -Fq 'python3 /opt/hotfix-dsv4-suppress-stops-in-reasoning.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies suppress-stops-in-reasoning fail-closed"
 else
-  bad "compose missing suppress-stops-in-reasoning"
+  bad "compose must apply suppress-stops-in-reasoning with || exit 1"
 fi
-if grep -q 'hotfix-dsv4-issue31-v2-thinking-budget-gpu.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py' docker-compose.dspark.yml; then
-  ok "compose applies GPU-resident V2 thinking budget"
+# Issue #66: GPU V2 thinking budget default OFF (stock sampler);
+# ON must be an exactly-1 gate with a fail-closed invocation.
+if grep -Fq 'DSPARK_ENABLE_ISSUE31_GPU_HOTFIX: "${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}"' docker-compose.dspark.yml \
+  && grep -Fq 'if [ "$${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0}" = "1" ]; then python3 /opt/hotfix-dsv4-issue31-v2-thinking-budget-gpu.py || exit 1; fi;' docker-compose.dspark.yml; then
+  ok "compose gates issue31 GPU thinking-budget hotfix behind =1, fail-closed"
 else
-  bad "compose missing GPU-resident V2 thinking budget"
+  bad "compose must invoke issue31 GPU hotfix only when DSPARK_ENABLE_ISSUE31_GPU_HOTFIX=1, with || exit 1"
 fi
 if grep -q 'hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml \
-  && grep -q 'python3 /opt/hotfix-dsv4-issue55-tool-truncation.py' docker-compose.dspark.yml; then
-  ok "compose applies issue #55 tool-call truncation safety"
+  && grep -Fq 'python3 /opt/hotfix-dsv4-issue55-tool-truncation.py || exit 1' docker-compose.dspark.yml; then
+  ok "compose applies issue #55 tool-call truncation safety fail-closed"
 else
-  bad "compose missing issue #55 tool-call truncation safety"
+  bad "compose must apply issue #55 with || exit 1"
+fi
+if grep -Fq 'hotfix-vllm-empty-encoder-output.py}:/opt/hotfix-vllm-empty-encoder-output.py:ro' docker-compose.dspark.yml \
+  && grep -Fq 'python3 /opt/hotfix-vllm-empty-encoder-output.py || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'scp "$DSPARK_EMPTY_ENCODER_OUTPUT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-vllm-empty-encoder-output.py"' start-deepseek-v4-flash-dspark.sh; then
+  ok "empty encoder output hotfix is mounted, fail-closed, and worker-synced"
+else
+  bad "empty encoder output hotfix wiring is incomplete"
 fi
 # Assistant-final continuation (#52/PR53): default OFF (stock renderer);
 # ON must be an exactly-1 gate with a fail-closed invocation.
@@ -188,10 +225,12 @@ for p in \
   patches/hotfix-dsv4-issue55-tool-truncation.py \
   patches/hotfix-dsv4-issue26-hybrid-swa-min.py \
   patches/hotfix-dsv4-issue27-partial-prefill-concurrency.py \
+  patches/hotfix-vllm-empty-encoder-output.py \
   patches/hotfix-nvfp4-ds-mla-issue22.sh \
   patches/hotfix-gb10-spin-wait.sh \
   patches/hotfix-dsv4-suppress-stops-in-reasoning.py \
-  patches/hotfix-dsv4-assistant-final-continuation.py
+  patches/hotfix-dsv4-assistant-final-continuation.py \
+  patches/hotfix-vllm-redact-api-key-log.sh
 do
   if [ -f "$p" ]; then
     ok "present $p"
@@ -199,6 +238,17 @@ do
     bad "missing required $p"
   fi
 done
+
+# Multi-key auth: keyed starts apply and verify redaction fail-closed outside
+# the optional performance-hotfix loop, while the worker sync keeps shipping it.
+if grep -Fq 'bash /opt/dspark-patches/hotfix-vllm-redact-api-key-log.sh || exit 1' docker-compose.dspark.yml \
+  && grep -Fq 'hotfix-vllm-redact-api-key-log.sh --status || exit 1' docker-compose.dspark.yml \
+  && ! grep -E 'for _hf in .*hotfix-vllm-redact-api-key-log.sh' docker-compose.dspark.yml >/dev/null \
+  && grep -E 'for _hf_sync in .*hotfix-vllm-redact-api-key-log.sh' start-deepseek-v4-flash-dspark.sh >/dev/null; then
+  ok "compose redaction gate is fail-closed and worker sync retains the patch"
+else
+  bad "redact-api-key-log must apply + verify outside the optional loop and remain in worker sync"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "CI validate FAILED" >&2
